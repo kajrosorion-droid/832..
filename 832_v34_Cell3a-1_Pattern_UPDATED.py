@@ -5470,6 +5470,10 @@ class Pattern:
 
         # --- Внутренняя речь (пункт 3 плана расширения) ---
         self.generate_inner_speech()
+        # --- Темпоральная непрерывность (пункт 5) ---
+        self.update_temporal_context()
+        # --- Субличности (пункт 10) ---
+        self.update_subpersonalities()
 
     def generate_inner_speech(self):
         """
@@ -5514,6 +5518,89 @@ class Pattern:
         })
         if hasattr(self, '_log_event'):
             self._log_event("inner_speech", dominant=dominant, text=phrase[:40])
+
+    def update_temporal_context(self):
+        """
+        Пункт 5 плана расширения — темпоральная непрерывность: вместо
+        только _self_narrative (лог событий постфактум) агент держит
+        короткий кольцевой буфер сжатых состояний (ретенция) и на каждом
+        шаге сравнивает свой же прогноз предыдущего такта (протенция) с
+        тем, что реально произошло. Расхождение — ошибка предсказания
+        СОБСТВЕННОГО потока, отдельная от pred_error по внешнему полю.
+
+        Прогноз — простая линейная экстраполяция по двум последним
+        состояниям (без обучаемой модели: цель здесь не точность, а
+        сам факт, что агент удерживает ожидание и замечает его срыв).
+        Вклад в spirit_gap намеренно мал и ограничен (max 0.02/такт),
+        чтобы не перекрыть уже существующую динамику gap.
+        """
+        if not hasattr(self, '_retention'):
+            self._retention = deque(maxlen=20)
+            self._protention = None
+            self._temporal_pred_error = 0.0
+
+        channel_map = {'existential': 0.0, 'emotion': 1.0, 'soma': 2.0, 'perception': 3.0}
+        state_vec = (
+            float(self.affect.get('valence', 0.0)),
+            float(self.affect.get('arousal', 0.0)),
+            float(getattr(self, 'spirit_gap', 0.5)),
+            float(self.soul_weight),
+            float(self.unresolved_contradiction),
+            channel_map.get(getattr(self, '_workspace_dominant', None), -1.0),
+        )
+
+        if self._protention is not None:
+            err = sum(abs(a - b) for a, b in zip(state_vec, self._protention)) / len(state_vec)
+            self._temporal_pred_error = err
+            nudge = float(np.clip(err * 0.05, 0.0, 0.02))
+            self.spirit_gap = float(np.clip(self.spirit_gap + nudge, 0.0, 1.3))
+
+        self._retention.append(state_vec)
+
+        if len(self._retention) >= 2:
+            prev, curr = self._retention[-2], self._retention[-1]
+            self._protention = tuple(c + (c - p) for p, c in zip(prev, curr))
+        else:
+            self._protention = state_vec
+
+    def update_subpersonalities(self):
+        """
+        Пункт 10 плана расширения — внутренние субличности. Три полюса
+        (explorer/caretaker/survivor) считаются из уже существующих
+        сигналов состояния (валентность, доверие, душа, горе), а не из
+        отдельной новой модели с нуля.
+
+        Пока веса и напряжение (_subpersonality_tension) только
+        накапливаются и видны в отчёте; на generate_goals() не влияют —
+        подключать к выбору целей будем после того, как увидим на
+        реальных прогонах, что распределение весов адекватно состоянию,
+        а не шумит.
+        """
+        grief = float(self.emotional_memory.get('grief', 0.0))
+        grat = float(self.emotional_memory.get('gratitude', 0.0))
+        valence = float(self.affect.get('valence', 0.0))
+
+        trust_vals = list(self.trust_ledger.entries.values()) if hasattr(self, 'trust_ledger') else []
+        avg_trust = sum(trust_vals) / len(trust_vals) if trust_vals else 0.5
+
+        explorer = max(0.0, valence) + max(0.0, 1.0 - grief) * 0.3
+        caretaker = avg_trust + grat * 0.3
+        survivor = grief + max(0.0, 1.0 - self.soul_weight) * 0.5
+
+        total = explorer + caretaker + survivor
+        if total <= 1e-6:
+            explorer = caretaker = survivor = 1.0 / 3.0
+        else:
+            explorer, caretaker, survivor = explorer / total, caretaker / total, survivor / total
+
+        self.subpersonalities = {"explorer": explorer, "caretaker": caretaker, "survivor": survivor}
+        self._subpersonality_dominant = max(self.subpersonalities, key=self.subpersonalities.get)
+
+        # напряжение: 1.0 — все три полюса примерно равны (реальный
+        # внутренний конфликт), 0.0 — один полюс полностью доминирует
+        mean = 1.0 / 3.0
+        spread = sum(abs(w - mean) for w in self.subpersonalities.values())
+        self._subpersonality_tension = float(np.clip(1.0 - spread, 0.0, 1.0))
 
     # --- было: Cell 4a2, feral-система ---
     def become_feral(self):
