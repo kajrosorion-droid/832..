@@ -1981,11 +1981,34 @@ class EvolutionEngine:
 
         Счётчики в _fold_transition_stats — то, что раньше приходилось
         выяснять диагностикой ablation, теперь видно прямо в отчёте.
+
+        ИСПРАВЛЕНО (было FOLDS_FOR_DEEP_FALL=1 при входном условии
+        fold_count>=1 — ветка "broken" была недостижима, реальный прогон
+        подтвердил broken=0 всегда). Теперь градация настоящая:
+          fold_count 1-2  -> "broken": шанс QUICK_FALL_PROB, мягкий
+                             откат души (BROKEN_FALL_SOUL_TARGET),
+                             короткий путь к искуплению.
+          fold_count >= 3 -> "fallen": гарантированно, тяжёлый откат
+                             души (DEEP_FALL_SOUL_PENALTY), долгий путь.
+
+        ИСПРАВЛЕНО (round 3): бросок кубика раньше происходил на КАЖДОМ
+        тике, пока агент ждал открытия disorg_hard_cap — то есть
+        вероятность фактически перемножалась с частотой тиков. Когда
+        кап открыт часто (как в реальном прогоне, где блокировал лишь
+        28% попыток), это гарантированно ловит "мягкий" исход раньше,
+        чем fold_count успевает дорасти до порога глубокого падения —
+        независимо от конкретного значения QUICK_FALL_PROB (проверено
+        на 0.5 и на 0.12, оба раза fallen=0). Теперь бросок делается
+        РОВНО ОДИН РАЗ на каждый новый уровень fold_count — кап всё ещё
+        может отложить попытку на потом, но не даёт лишних попыток на
+        одном и том же уровне. Частота попыток теперь определяется
+        частотой реальных fold-событий (раз в FOLD_COOLDOWN_DURATION),
+        а не частотой тиков.
         """
         if not hasattr(self, '_fold_transition_stats'):
             self._fold_transition_stats = {
                 'checked': 0, 'blocked_by_cooldown': 0, 'blocked_by_cap': 0,
-                'fallen': 0, 'broken': 0,
+                'already_rolled': 0, 'fallen': 0, 'broken': 0,
             }
         st = self._fold_transition_stats
 
@@ -1999,6 +2022,10 @@ class EvolutionEngine:
             st['checked'] += 1
             if getattr(p, '_redemption_cooldown', 0) > p.age:
                 st['blocked_by_cooldown'] += 1
+                continue
+
+            if getattr(p, '_last_fold_roll_count', 0) == fold_count:
+                st['already_rolled'] += 1
                 continue
 
             disorganizer_cnt = len([pp for pp in self.patterns if pp.alive and pp.role_type == "disorganizer"])
@@ -2016,9 +2043,14 @@ class EvolutionEngine:
                 )
             else:
                 prob, soul_target, redemption_delay, fall_type = (
-                    Config.QUICK_FALL_PROB, Config.FORCED_SOUL_COLLAPSE_VALUE,
+                    Config.QUICK_FALL_PROB, Config.BROKEN_FALL_SOUL_TARGET,
                     Config.REDEMPTION_ARC_STEP_DELAY, "broken",
                 )
+
+            # Отмечаем попытку на этом уровне СЕЙЧАС, до исхода броска —
+            # неудача тоже расходует единственную попытку этого уровня,
+            # следующая будет только когда fold_count вырастет ещё раз.
+            p._last_fold_roll_count = fold_count
 
             if phi_hash(p.id, t, 777) >= prob:
                 continue
