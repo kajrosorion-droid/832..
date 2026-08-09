@@ -846,6 +846,17 @@ class EvolutionEngine:
             if normal_count >= self._get_pop_cap():
                 continue
             child = self.create_pattern({(spore['x'], spore['y'])}, parent=p)
+            if child is None:
+                # ИСПРАВЛЕНО: create_pattern содержит свой, более строгий
+                # потолок (alive_now>=200, считает ВСЕХ живых, включая
+                # disorganizer/feral), тогда как проверка выше в этом
+                # методе сравнивает normal_count с _get_pop_cap() — это
+                # разные величины и могут разойтись на переходных тактах
+                # (напр. много disorganizer/feral раздувают alive_now,
+                # не влияя на normal_count). Раньше это падало с
+                # AttributeError на child.scar_dream; теперь спора просто
+                # ждёт следующего тика, когда место освободится.
+                continue
             child.scar_dream = spore['scar_dream']
             p.pending_spore = None
 
@@ -921,6 +932,16 @@ class EvolutionEngine:
             else:
                 if normal_cnt < self._get_pop_cap():
                     p = self.create_pattern(cells)
+                    if p is None:
+                        # ИСПРАВЛЕНО: та же гонка каптов, что и в process_spores —
+                        # normal_cnt/_get_pop_cap() здесь и alive_now>=200
+                        # внутри create_pattern считают разные вещи и могут
+                        # разойтись. Раньше None тихо попадал в self.patterns
+                        # и падало где-то дальше по тику, в произвольном месте
+                        # (любой метод, читающий self.patterns как список живых
+                        # Pattern). Просто теряем этот компонент поля на этот
+                        # тик — он не привязан ни к какому существующему агенту.
+                        continue
                     updated.append(p)
                     normal_cnt += 1
         for p in alive_old:
@@ -1990,11 +2011,25 @@ class EvolutionEngine:
                              короткий путь к искуплению.
           fold_count >= 3 -> "fallen": гарантированно, тяжёлый откат
                              души (DEEP_FALL_SOUL_PENALTY), долгий путь.
+
+        ИСПРАВЛЕНО (round 3): бросок кубика раньше происходил на КАЖДОМ
+        тике, пока агент ждал открытия disorg_hard_cap — то есть
+        вероятность фактически перемножалась с частотой тиков. Когда
+        кап открыт часто (как в реальном прогоне, где блокировал лишь
+        28% попыток), это гарантированно ловит "мягкий" исход раньше,
+        чем fold_count успевает дорасти до порога глубокого падения —
+        независимо от конкретного значения QUICK_FALL_PROB (проверено
+        на 0.5 и на 0.12, оба раза fallen=0). Теперь бросок делается
+        РОВНО ОДИН РАЗ на каждый новый уровень fold_count — кап всё ещё
+        может отложить попытку на потом, но не даёт лишних попыток на
+        одном и том же уровне. Частота попыток теперь определяется
+        частотой реальных fold-событий (раз в FOLD_COOLDOWN_DURATION),
+        а не частотой тиков.
         """
         if not hasattr(self, '_fold_transition_stats'):
             self._fold_transition_stats = {
                 'checked': 0, 'blocked_by_cooldown': 0, 'blocked_by_cap': 0,
-                'fallen': 0, 'broken': 0,
+                'already_rolled': 0, 'fallen': 0, 'broken': 0,
             }
         st = self._fold_transition_stats
 
@@ -2008,6 +2043,10 @@ class EvolutionEngine:
             st['checked'] += 1
             if getattr(p, '_redemption_cooldown', 0) > p.age:
                 st['blocked_by_cooldown'] += 1
+                continue
+
+            if getattr(p, '_last_fold_roll_count', 0) == fold_count:
+                st['already_rolled'] += 1
                 continue
 
             disorganizer_cnt = len([pp for pp in self.patterns if pp.alive and pp.role_type == "disorganizer"])
@@ -2028,6 +2067,11 @@ class EvolutionEngine:
                     Config.QUICK_FALL_PROB, Config.BROKEN_FALL_SOUL_TARGET,
                     Config.REDEMPTION_ARC_STEP_DELAY, "broken",
                 )
+
+            # Отмечаем попытку на этом уровне СЕЙЧАС, до исхода броска —
+            # неудача тоже расходует единственную попытку этого уровня,
+            # следующая будет только когда fold_count вырастет ещё раз.
+            p._last_fold_roll_count = fold_count
 
             if phi_hash(p.id, t, 777) >= prob:
                 continue
